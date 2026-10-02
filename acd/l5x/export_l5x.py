@@ -168,6 +168,14 @@ class ExportL5x:
             self._project._id_to_name = self._id_to_name
         return self._project
 
+    def close(self):
+        if getattr(self, "_cur", None) is not None:
+            self._cur.close()
+            self._cur = None
+        if getattr(self, "_db", None) is not None:
+            self._db.close()
+            self._db = None
+
     def populate_region_map(self):
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id=0 AND comp_name='Region Map'"
