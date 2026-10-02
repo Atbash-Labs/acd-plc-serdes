@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from os import PathLike
 from pathlib import Path
 from sqlite3 import Cursor
-from typing import List, Tuple, Dict, Union
+from typing import List, Tuple, Dict, Union, Optional
 
 from acd.generated.comps.rx_generic import RxGeneric
 from acd.l5x.catalog_numbers import CATALOG_NUMBERS
@@ -19,6 +19,8 @@ from acd.l5x.port_structures import PORT_STRUCTURES
 # Characters that are illegal in XML 1.0: everything outside
 # #x9 | #xA | #xD | #x20-#xD7FF | #xE000-#xFFFD | #x10000-#x10FFFF.
 _XML_ILLEGAL_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
+_ST_COMP_REF_RE = re.compile(r"@([0-9a-fA-F]{8})@")
+_WINDOWS_PATH_ILLEGAL_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
 def _escape_xml_attr(value: object) -> str:
@@ -35,6 +37,12 @@ def _escape_xml_attr(value: object) -> str:
     text = _XML_ILLEGAL_RE.sub("", str(value))
     text = html.escape(text, quote=True)
     return text.replace("\t", "&#x9;").replace("\r", "&#xD;").replace("\n", "&#xA;")
+
+
+def _safe_path_component(value: object) -> str:
+    name = _WINDOWS_PATH_ILLEGAL_RE.sub("_", str(value)).strip()
+    name = name.rstrip(". ")
+    return name or "_"
 
 
 @dataclass
@@ -802,11 +810,12 @@ class Routine(L5xElement):
     name: str
     type: str
     rungs: List[str]
+    st_lines: List[str] = field(default_factory=list)
     _rung_ids: List[int] = field(default_factory=list)
     _rung_comments: Dict[int, str] = field(default_factory=dict)
 
     def to_xml(self) -> str:
-        rll_content = ""
+        content = ""
         if self.type == "RLL" and self.rungs:
             rung_xmls = []
             for i, rung_text in enumerate(self.rungs):
@@ -824,8 +833,15 @@ class Routine(L5xElement):
                     f'</Rung>'
                 )
             if rung_xmls:
-                rll_content = f'<RLLContent>{"".join(rung_xmls)}</RLLContent>'
-        return f'<Routine Name="{_escape_xml_attr(self.name)}" Type="{self.type}">{rll_content}</Routine>'
+                content = f'<RLLContent>{"".join(rung_xmls)}</RLLContent>'
+        elif self.type == "ST" and self.st_lines:
+            line_xmls = []
+            for i, line_text in enumerate(self.st_lines):
+                line_xmls.append(
+                    f'<Line Number="{i}"><![CDATA[{line_text}]]></Line>'
+                )
+            content = f'<STContent>{"".join(line_xmls)}</STContent>'
+        return f'<Routine Name="{_escape_xml_attr(self.name)}" Type="{self.type}">{content}</Routine>'
 
 
 @dataclass
@@ -1852,6 +1868,95 @@ def routine_type_enum(idx: int) -> str:
     return "Typeless"
 
 
+def _parse_st_source_record(data: bytes) -> Optional[Tuple[int, str]]:
+    marker = data.find(b"\xff\xfe\xff")
+    if marker == -1 or marker + 4 > len(data) or marker < 4:
+        return None
+
+    length = data[marker + 3]
+    text_start = marker + 4
+    text_end = text_start + length * 2
+    if text_end > len(data):
+        return None
+
+    try:
+        text = data[text_start:text_end].decode("utf-16-le")
+    except UnicodeDecodeError:
+        return None
+
+    order = struct.unpack_from("<I", data, marker - 4)[0]
+    return order, text
+
+
+def _resolve_st_record_tokens(cur: Cursor, text: str) -> str:
+    refs = {match.group(1) for match in _ST_COMP_REF_RE.finditer(text)}
+    if not refs:
+        return text
+
+    id_to_name: Dict[str, str] = {}
+    for hex_id in refs:
+        oid = int(hex_id, 16)
+        cur.execute("SELECT comp_name FROM comps WHERE object_id=?", (oid,))
+        row = cur.fetchone()
+        if row and row[0]:
+            id_to_name[hex_id.lower()] = row[0]
+
+    if not id_to_name:
+        return text
+
+    def replace_ref(match: re.Match[str]) -> str:
+        return id_to_name.get(match.group(1).lower(), match.group(0))
+
+    return _ST_COMP_REF_RE.sub(replace_ref, text)
+
+
+def _extract_st_source_lines(cur: Cursor, routine_object_id: int) -> List[str]:
+    cur.execute(
+        "SELECT rowid, object_id, parent_id, record FROM nameless WHERE parent_id=?",
+        (routine_object_id,),
+    )
+    pending = list(cur.fetchall())
+    children_by_parent: Dict[int, List[Tuple[int, int, bytes]]] = {}
+    seen = set()
+
+    while pending:
+        rowid, object_id, parent_id, record = pending.pop(0)
+        if object_id in seen:
+            continue
+        seen.add(object_id)
+        children_by_parent.setdefault(parent_id, []).append((rowid, object_id, record))
+        cur.execute(
+            "SELECT rowid, object_id, parent_id, record FROM nameless WHERE parent_id=?",
+            (object_id,),
+        )
+        pending.extend(cur.fetchall())
+
+    source_groups: List[Tuple[int, List[Tuple[int, str]]]] = []
+    for parent_id, children in children_by_parent.items():
+        parsed_lines: List[Tuple[int, str]] = []
+        for _rowid, _object_id, record in sorted(children, key=lambda child: child[0]):
+            parsed = _parse_st_source_record(record)
+            if parsed is not None:
+                parsed_lines.append(parsed)
+
+        parsed_lines = [
+            (order, line) for order, line in parsed_lines if order != 0xFFFFFFFF
+        ]
+        if parsed_lines and any(line.strip() for _order, line in parsed_lines):
+            source_groups.append((parent_id, sorted(parsed_lines, key=lambda item: item[0])))
+
+    ordered_lines: List[str] = []
+    for _parent_id, parsed_lines in sorted(
+        source_groups,
+        key=lambda group: (group[1][0][0] if group[1] else 0, group[0]),
+    ):
+        ordered_lines.extend(
+            _resolve_st_record_tokens(cur, line) for _order, line in parsed_lines
+        )
+
+    return ordered_lines
+
+
 @dataclass
 class RoutineBuilder(L5xElementBuilder):
     def build(self) -> Routine:
@@ -1924,7 +2029,17 @@ class RoutineBuilder(L5xElementBuilder):
         except Exception:
             pass
 
-        return Routine(name, name, routine_type, rungs, rung_ids, rung_comments)
+        return Routine(
+            name,
+            name,
+            routine_type,
+            rungs,
+            _extract_st_source_lines(self._cur, self._object_id)
+            if routine_type == "ST"
+            else [],
+            rung_ids,
+            rung_comments,
+        )
 
 
 def _parse_fffeff(data: bytes, offset: int):
@@ -2715,13 +2830,14 @@ class DumpCompsRecords(L5xElementBuilder):
         for result in results:
             object_id = result[1]
             name = result[0]
+            path_name = _safe_path_component(name)
             record = result[4]
-            new_path = Path(os.path.join(self.base_directory, name))
+            new_path = Path(os.path.join(self.base_directory, path_name))
             if os.path.exists(os.path.join(new_path)):
                 shutil.rmtree(os.path.join(new_path))
             if not os.path.exists(os.path.join(new_path)):
                 os.makedirs(new_path)
-            with open(Path(os.path.join(new_path, name + ".dat")), "wb") as file:
+            with open(Path(os.path.join(new_path, path_name + ".dat")), "wb") as file:
                 log_file.write(
                     f"Class - {struct.unpack_from('<H', result[4], 0xA)[0]} Instance {struct.unpack_from('<H', result[4], 0xC)[0]}- {str(new_path) + '/' + name}\n"
                 )

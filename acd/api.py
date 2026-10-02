@@ -165,7 +165,10 @@ class ImportProjectFromFile(ImportProject):
     def import_project(self) -> RSLogix5000Content:
         # Import Project Interface
         export = ExportL5x(self.filename)
-        return export.project
+        try:
+            return export.project
+        finally:
+            export.close()
 
 
 @dataclass
@@ -251,11 +254,14 @@ class DumpCompsRecordsToFile(ExportProject):
 
     def extract(self):
         export = ExportL5x(self.filename)
-        with open(
-            os.path.join(self.output_directory, "output.log"),
-            "w",
-        ) as log_file:
-            DumpCompsRecords(export._cur, 0).dump(log_file=log_file)
+        try:
+            with open(
+                os.path.join(self.output_directory, "output.log"),
+                "w",
+            ) as log_file:
+                DumpCompsRecords(export._cur, 0).dump(log_file=log_file)
+        finally:
+            export.close()
 
 
 @dataclass
